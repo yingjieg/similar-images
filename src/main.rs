@@ -59,61 +59,64 @@ struct Entry {
     hash: ImageHash,
 }
 
+fn ext_lower(path: &Path) -> Option<String> {
+    path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase())
+}
+
 fn is_image(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| EXTENSIONS.contains(&e.to_lowercase().as_str()))
+    ext_lower(path)
+        .map(|e| EXTENSIONS.contains(&e.as_str()))
         .unwrap_or(false)
 }
 
 fn is_heic(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|e| {
-            let e = e.to_lowercase();
-            e == "heic" || e == "heif"
-        })
+    ext_lower(path)
+        .map(|e| e == "heic" || e == "heif")
         .unwrap_or(false)
+}
+
+/// Why decoding an image file failed, so callers can report the real cause instead of
+/// re-deriving it (e.g. re-checking the platform and extension to guess "must be HEIC").
+enum OpenError {
+    Io,
+    UnsupportedHeic,
+    Decode,
 }
 
 /// Decode a HEIC/HEIF file into a `DynamicImage` via libheif, since the `image` crate
 /// (pinned to 0.23 for compatibility with `img_hash`) has no HEIC decoder.
 #[cfg(not(windows))]
-fn open_heic(lib_heif: &LibHeif, path: &Path) -> Option<image::DynamicImage> {
-    let ctx = HeifContext::read_from_file(path.to_str()?).ok()?;
-    let handle = ctx.primary_image_handle().ok()?;
+fn open_heic(lib_heif: &LibHeif, bytes: &[u8]) -> Result<image::DynamicImage, OpenError> {
+    let ctx = HeifContext::read_from_bytes(bytes).map_err(|_| OpenError::Decode)?;
+    let handle = ctx.primary_image_handle().map_err(|_| OpenError::Decode)?;
     let heif_img = lib_heif
         .decode(&handle, ColorSpace::Rgb(RgbChroma::Rgb), None)
-        .ok()?;
+        .map_err(|_| OpenError::Decode)?;
     let width = heif_img.width();
     let height = heif_img.height();
     let planes = heif_img.planes();
-    let plane = planes.interleaved?;
+    let plane = planes.interleaved.ok_or(OpenError::Decode)?;
     let row_bytes = (width * 3) as usize;
     let mut buf = vec![0u8; row_bytes * height as usize];
     for y in 0..height as usize {
         let src = &plane.data[y * plane.stride..y * plane.stride + row_bytes];
         buf[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(src);
     }
-    let rgb = image::RgbImage::from_raw(width, height, buf)?;
-    Some(image::DynamicImage::ImageRgb8(rgb))
+    let rgb = image::RgbImage::from_raw(width, height, buf).ok_or(OpenError::Decode)?;
+    Ok(image::DynamicImage::ImageRgb8(rgb))
 }
 
 #[cfg(windows)]
-fn open_heic(_lib_heif: &LibHeif, _path: &Path) -> Option<image::DynamicImage> {
-    None
+fn open_heic(_lib_heif: &LibHeif, _bytes: &[u8]) -> Result<image::DynamicImage, OpenError> {
+    Err(OpenError::UnsupportedHeic)
 }
 
-/// Read the EXIF `Orientation` tag (1-8, default 1 = upright) from a file.
-/// `kamadak-exif` natively understands the JPEG/TIFF/HEIF/PNG/WebP containers, so this
-/// works for every format this tool handles, including HEIC photos from phones.
-fn read_exif_orientation(path: &Path) -> u32 {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return 1,
-    };
-    let mut bufreader = std::io::BufReader::new(file);
-    let exif = match exif::Reader::new().read_from_container(&mut bufreader) {
+/// Read the EXIF `Orientation` tag (1-8, default 1 = upright) from already-loaded file
+/// bytes. `kamadak-exif` natively understands the JPEG/TIFF/HEIF/PNG/WebP containers, so
+/// this works for every format this tool handles, including HEIC photos from phones.
+fn read_exif_orientation(bytes: &[u8]) -> u32 {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let exif = match exif::Reader::new().read_from_container(&mut cursor) {
         Ok(e) => e,
         Err(_) => return 1,
     };
@@ -138,13 +141,17 @@ fn apply_exif_orientation(img: image::DynamicImage, orientation: u32) -> image::
     }
 }
 
-fn open_image(lib_heif: &LibHeif, path: &Path) -> Option<image::DynamicImage> {
+/// Read a file once and decode both its pixels and its EXIF orientation from that single
+/// buffer, instead of letting the image decoder and the EXIF reader each open and read
+/// the file independently.
+fn open_image(lib_heif: &LibHeif, path: &Path) -> Result<image::DynamicImage, OpenError> {
+    let bytes = std::fs::read(path).map_err(|_| OpenError::Io)?;
     let img = if is_heic(path) {
-        open_heic(lib_heif, path)?
+        open_heic(lib_heif, &bytes)?
     } else {
-        image::open(path).ok()?
+        image::load_from_memory(&bytes).map_err(|_| OpenError::Decode)?
     };
-    Some(apply_exif_orientation(img, read_exif_orientation(path)))
+    Ok(apply_exif_orientation(img, read_exif_orientation(&bytes)))
 }
 
 fn collect_paths(dir: &Path, recursive: bool) -> Vec<PathBuf> {
@@ -168,6 +175,13 @@ fn format_bytes(n: u64) -> String {
     } else {
         format!("{} B", n as u64)
     }
+}
+
+/// Bytes reclaimed if every member of `group` is deleted except the largest (the
+/// suggested keeper). Assumes `group` is sorted by size descending.
+fn group_reclaim(entries: &[Entry], group: &[usize]) -> u64 {
+    let total: u64 = group.iter().map(|&i| entries[i].size).sum();
+    total - entries[group[0]].size
 }
 
 fn html_escape(s: &str) -> String {
@@ -201,7 +215,7 @@ fn generate_thumbnail(
     idx: usize,
     size: u32,
 ) -> Option<String> {
-    let img = open_image(lib_heif, path)?;
+    let img = open_image(lib_heif, path).ok()?;
     let file_name = format!("thumb_{}.jpg", idx);
     let out_path = thumb_dir.join(&file_name);
     img.thumbnail(size, size)
@@ -230,7 +244,7 @@ fn main() {
     let thumb_dir = output
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(thumb_dir_name);
+        .join(&thumb_dir_name);
 
     let paths = collect_paths(&args.dir, !args.no_recursive);
     if paths.is_empty() {
@@ -245,16 +259,16 @@ fn main() {
         .par_iter()
         .filter_map(|path| {
             let img = match open_image(&lib_heif, path) {
-                Some(img) => img,
-                None => {
-                    if cfg!(windows) && is_heic(path) {
-                        eprintln!(
-                            "Skipping {:?}: HEIC/HEIF is not supported in the Windows build",
-                            path
-                        );
-                    } else {
-                        eprintln!("Skipping {:?}: failed to decode", path);
-                    }
+                Ok(img) => img,
+                Err(OpenError::UnsupportedHeic) => {
+                    eprintln!(
+                        "Skipping {:?}: HEIC/HEIF is not supported in this build",
+                        path
+                    );
+                    return None;
+                }
+                Err(_) => {
+                    eprintln!("Skipping {:?}: failed to decode", path);
                     return None;
                 }
             };
@@ -303,8 +317,11 @@ fn main() {
             continue;
         }
         assigned[i] = true;
+        // A plain sequential scan beats `par_iter` here: a hash `dist` is a handful of
+        // XOR+popcount ops, so rayon's per-call task-splitting overhead would dominate
+        // the actual work for most representatives.
         let matches: Vec<usize> = order
-            .par_iter()
+            .iter()
             .cloned()
             .filter(|&j| j != i && !assigned[j] && entries[i].hash.dist(&entries[j].hash) <= args.threshold)
             .collect();
@@ -324,11 +341,7 @@ fn main() {
     for group in &mut duplicate_groups {
         group.sort_by_key(|&i| std::cmp::Reverse(entries[i].size));
     }
-    duplicate_groups.sort_by_key(|g| {
-        let max_size = entries[g[0]].size;
-        let total: u64 = g.iter().map(|&i| entries[i].size).sum();
-        std::cmp::Reverse(total - max_size)
-    });
+    duplicate_groups.sort_by_key(|g| std::cmp::Reverse(group_reclaim(&entries, g)));
 
     if duplicate_groups.is_empty() {
         println!("No similar photo groups found.");
@@ -338,11 +351,7 @@ fn main() {
     let total_dup_files: usize = duplicate_groups.iter().map(|g| g.len()).sum();
     let reclaimable: u64 = duplicate_groups
         .iter()
-        .map(|g| {
-            let max_size = entries[g[0]].size;
-            let total: u64 = g.iter().map(|&i| entries[i].size).sum();
-            total - max_size
-        })
+        .map(|g| group_reclaim(&entries, g))
         .sum();
 
     println!(
@@ -399,16 +408,12 @@ fn main() {
     ));
 
     for (gi, group) in duplicate_groups.iter().enumerate() {
-        let max_size = entries[group[0]].size;
-        let total: u64 = group.iter().map(|&i| entries[i].size).sum();
-        let group_reclaim = total - max_size;
-
         html.push_str(&format!(
             "<div class=\"group\"><h2>Group {} &mdash; {} photos</h2>\
              <div class=\"meta\">reclaimable: {}</div><div class=\"cards\">",
             gi + 1,
             group.len(),
-            format_bytes(group_reclaim)
+            format_bytes(group_reclaim(&entries, group))
         ));
 
         for (mi, &idx) in group.iter().enumerate() {
@@ -423,17 +428,13 @@ fn main() {
                 .get(&idx)
                 .cloned()
                 .unwrap_or_else(|| "".to_string());
-            let thumb_dir_rel = format!(
-                "{}_thumbs",
-                output.file_stem().unwrap_or_default().to_string_lossy()
-            );
             html.push_str(&format!(
                 "<div class=\"card{}\"><a href=\"{}\" target=\"_blank\">\
                  <img src=\"{}/{}\" loading=\"lazy\"></a>\
                  <div class=\"info\">{}{}<br>{} &times; {}<br>{}</div></div>",
                 keep_class,
                 file_url(&e.path),
-                thumb_dir_rel,
+                thumb_dir_name,
                 thumb_src,
                 badge,
                 html_escape(&e.path.display().to_string()),
